@@ -5,19 +5,53 @@ A simple utility for searching Bitcoin wallets [Bitcoin Puzzle Transaction](http
 ## Usage
 
 ```bash
-bit-scan <public_key> <bits> [--view]
+bit-scan scan [--version <v1|v2|v3|v4>] [--stats] [--threads <count>] <target>
+bit-scan check <address> <private_key>
 ```
 
-- `public_key` is the Bitcoin address you want to scan for.
-- `bits` is the number of bits to scan (wallet number in the table).
-- `--view` (optional) will print the finding progress to the console.
+- `scan` searches for the private key that matches the given Base58 Bitcoin address.
+- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` CUDA batch, `v4` multi-threaded CPU).
+- `--threads` sets the worker pool size (required when `--version v4` is selected).
+- `--stats` prints a rolling throughput report once per second (candidates per second plus cumulative total).
+- `target` can be either a Bitcoin address **or** the puzzle number listed in the table below.
+- Bit length is inferred from the target (puzzle numbers supply their own size).
+- `private_key` for `check` accepts up to 64 hex characters (optionally prefixed with `0x`); shorter inputs are left-padded with zeros.
 
 ## Example
 
-You can test the utility by running a scan of a very simple wallet, for example, under number 10:
+Run a quick scan against puzzle wallet 10 using the pattern-driven engine:
+
 ```bash
-bit-scan 1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe 10 --view
+bit-scan scan --stats 10
 ```
+
+Run the multi-threaded CPU engine on puzzle wallet 10 with eight workers:
+
+```bash
+bit-scan scan --version v4 --threads 8 --stats 10
+```
+
+If you prefer to scan by address, add an entry to `config/puzzle_addresses.csv` so the tool can infer the correct bit length.
+
+Validate a private key against the same wallet (supports optional `0x` prefix):
+
+```bash
+bit-scan check 1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe 000000000000000202
+```
+
+### CUDA engine (v3)
+
+The `v3` engine batches candidate generation on the GPU via CUDA. Enable it at build time with:
+
+```bash
+cargo build --release --features cuda
+```
+
+Requirements:
+- NVIDIA GPU with a recent driver.
+- CUDA toolkit installed (`CUDA_PATH`, `CUDA_ROOT`, or `CUDA_TOOLKIT_ROOT_DIR` must point to it).
+
+If CUDA support is missing at build or runtime, version 3 automatically falls back to the CPU (`v1`) implementation.
 
 ## Found wallets
 
@@ -188,3 +222,8 @@ bit-scan 1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe 10 --view
 | 158 | 1D7eT6uU1M8k6WaW3pM6G5vXnm3n8n7Cfx  |                                  | Unsolved |
 | 159 | 1MNeT6yemMJSd7kt9L1PP2u3eZ8XsDTS3Y  |                                  | Unsolved |
 | 160 | 14yhdGZmW1Z9G3bZ1fY1KX7n7fY1KX7n7f  |                                  | Unsolved |
+
+
+
+
+
