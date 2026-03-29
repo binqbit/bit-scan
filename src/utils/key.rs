@@ -1,17 +1,23 @@
 use k256::{EncodedPoint, ecdsa::SigningKey};
 
-pub fn private_to_compressed_pubkey(private_key: &[u8; 32]) -> Vec<u8> {
+pub fn private_to_compressed_pubkey(private_key: &[u8; 32]) -> [u8; 33] {
     let signing_key = SigningKey::from_bytes(private_key.into()).expect("invalid private key");
     let verify_key = signing_key.verifying_key();
     let pubkey_point = EncodedPoint::from(verify_key);
-    pubkey_point.to_bytes().to_vec()
+    let pubkey_bytes = pubkey_point.to_bytes();
+    let mut out = [0u8; 33];
+    out.copy_from_slice(&pubkey_bytes);
+    out
 }
 
-pub fn private_to_uncompressed_pubkey(private_key: &[u8; 32]) -> Vec<u8> {
+pub fn private_to_uncompressed_pubkey(private_key: &[u8; 32]) -> [u8; 65] {
     let signing_key = SigningKey::from_bytes(private_key.into()).expect("invalid private key");
     let verify_key = signing_key.verifying_key();
     let pubkey_point = verify_key.to_encoded_point(false);
-    pubkey_point.to_bytes().to_vec()
+    let pubkey_bytes = pubkey_point.to_bytes();
+    let mut out = [0u8; 65];
+    out.copy_from_slice(&pubkey_bytes);
+    out
 }
 
 pub fn number_to_private_key(num: u128) -> [u8; 32] {

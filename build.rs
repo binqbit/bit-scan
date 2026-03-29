@@ -52,10 +52,10 @@ fn find_cuda_root() -> Option<PathBuf> {
         "CUDAToolkit_ROOT",
         "CUDA_TOOLKIT_ROOT_DIR",
     ] {
-        if let Some(path) = env::var_os(key).map(PathBuf::from) {
-            if has_nvrtc(&path) {
-                return Some(path);
-            }
+        if let Some(path) = env::var_os(key).map(PathBuf::from)
+            && has_nvrtc(&path)
+        {
+            return Some(path);
         }
     }
 
@@ -66,17 +66,13 @@ fn find_cuda_root() -> Option<PathBuf> {
         }
     }
 
-    for path in [
+    [
         PathBuf::from("/run/current-system/sw"),
         PathBuf::from("/usr/local/cuda"),
         PathBuf::from("/opt/cuda"),
-    ] {
-        if has_nvrtc(&path) {
-            return Some(path);
-        }
-    }
-
-    None
+    ]
+    .into_iter()
+    .find(|path| has_nvrtc(path))
 }
 
 fn has_nvrtc(root: &Path) -> bool {

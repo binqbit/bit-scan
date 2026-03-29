@@ -51,7 +51,22 @@ Requirements:
 - NVIDIA GPU with a recent driver.
 - CUDA toolkit installed (`CUDA_PATH`, `CUDA_ROOT`, or `CUDA_TOOLKIT_ROOT_DIR` must point to it).
 
-If CUDA support is missing at build or runtime, version 3 automatically falls back to the CPU (`v1`) implementation.
+Runtime tuning knobs for `v3`:
+- `BIT_SCAN_V3_BATCH_SIZE` sets candidates per GPU batch. Larger batches use more VRAM and RAM.
+- `BIT_SCAN_V3_VERIFY_THREADS` sets how many CPU threads verify generated candidates.
+- `BIT_SCAN_V3_BLOCK_SIZE` sets CUDA threads per block.
+- `BIT_SCAN_V3_ITEMS_PER_THREAD` sets how many candidates each CUDA thread generates before exiting.
+
+Example aggressive configuration:
+
+```bash
+BIT_SCAN_V3_BATCH_SIZE=2097152 \
+BIT_SCAN_V3_VERIFY_THREADS=15 \
+BIT_SCAN_V3_ITEMS_PER_THREAD=128 \
+cargo run --release -- scan --version v3 --stats 71
+```
+
+If CUDA support is missing at build or runtime, version 3 automatically falls back to the multi-threaded CPU (`v4`) implementation.
 
 ## Found wallets
 
