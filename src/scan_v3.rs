@@ -102,6 +102,12 @@ extern "C" __global__ void fill_randoms(
     pub fn scan(pubkey: &str, bits: u32, stats: bool) {
         assert!((1..=128).contains(&bits), "bits must be between 1 and 128");
 
+        if let Err(err) = crate::scan_v3_opencl::scan(pubkey, bits, stats) {
+            eprintln!("scan_v3: OpenCL full-GPU path unavailable ({err}). Trying CUDA fallback...");
+        } else {
+            return;
+        }
+
         if let Err(err) = scan_with_cuda(pubkey, bits, stats) {
             eprintln!(
                 "scan_v3: CUDA path unavailable ({err}). Falling back to version 4 engine..."
@@ -219,7 +225,9 @@ extern "C" __global__ void fill_randoms(
         }
     }
 
-    fn build_verifier_pool(verify_threads: usize) -> Result<ThreadPool, rayon::ThreadPoolBuildError> {
+    fn build_verifier_pool(
+        verify_threads: usize,
+    ) -> Result<ThreadPool, rayon::ThreadPoolBuildError> {
         ThreadPoolBuilder::new()
             .num_threads(verify_threads)
             .thread_name(|idx| format!("scan-v3-verify-{idx}"))
@@ -284,7 +292,9 @@ extern "C" __global__ void fill_randoms(
             ]
             .into_iter()
             .find(|path| path.exists())
-            .ok_or_else(|| "real NVIDIA driver library not found in /run/opengl-driver/lib".to_string())?;
+            .ok_or_else(|| {
+                "real NVIDIA driver library not found in /run/opengl-driver/lib".to_string()
+            })?;
             let driver_lib = Library::new(&driver)
                 .map_err(|err| format!("failed to load CUDA driver {}: {err}", driver.display()))?;
 
@@ -345,7 +355,14 @@ pub use cuda::scan;
 
 #[cfg(not(feature = "cuda"))]
 pub fn scan(pubkey: &str, bits: u32, stats: bool) {
-    eprintln!("scan_v3: binary built without CUDA support. Falling back to version 4 engine...");
+    if let Err(err) = crate::scan_v3_opencl::scan(pubkey, bits, stats) {
+        eprintln!(
+            "scan_v3: OpenCL full-GPU path unavailable ({err}). Falling back to version 4 engine..."
+        );
+    } else {
+        return;
+    }
+
     let threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)

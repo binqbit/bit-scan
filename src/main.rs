@@ -2,6 +2,7 @@ mod check;
 mod scan_v1;
 mod scan_v2;
 mod scan_v3;
+mod scan_v3_opencl;
 mod scan_v4;
 pub mod utils;
 

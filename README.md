@@ -39,9 +39,9 @@ Validate a private key against the same wallet (supports optional `0x` prefix):
 bit-scan check 1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe 000000000000000202
 ```
 
-### CUDA engine (v3)
+### GPU engine (v3)
 
-The `v3` engine batches candidate generation on the GPU via CUDA. Enable it at build time with:
+The `v3` engine now prioritizes a full-GPU path: `private key -> secp256k1 public key -> hash160 -> compare` runs on the GPU through OpenCL, with the older CUDA batch generator kept only as a fallback. Build the project with:
 
 ```bash
 cargo build --release --features cuda
@@ -50,23 +50,27 @@ cargo build --release --features cuda
 Requirements:
 - NVIDIA GPU with a recent driver.
 - CUDA toolkit installed (`CUDA_PATH`, `CUDA_ROOT`, or `CUDA_TOOLKIT_ROOT_DIR` must point to it).
+- OpenCL loader available at runtime. On Nix-based systems the scanner auto-discovers `ocl-icd` from `/nix/store`.
 
 Runtime tuning knobs for `v3`:
 - `BIT_SCAN_V3_BATCH_SIZE` sets candidates per GPU batch. Larger batches use more VRAM and RAM.
-- `BIT_SCAN_V3_VERIFY_THREADS` sets how many CPU threads verify generated candidates.
-- `BIT_SCAN_V3_BLOCK_SIZE` sets CUDA threads per block.
-- `BIT_SCAN_V3_ITEMS_PER_THREAD` sets how many candidates each CUDA thread generates before exiting.
+- `BIT_SCAN_V3_ITEMS_PER_THREAD` sets how many adjacent candidates each GPU work-item processes before the next launch.
+- `BIT_SCAN_V3_BLOCK_SIZE` sets the GPU local work size / workgroup size.
+- `BIT_SCAN_V3_OPENCL_DEVICE_INDEX` selects the OpenCL GPU device index for the full-GPU path.
+- `BIT_SCAN_V3_VERIFY_THREADS` only affects the legacy CUDA fallback path.
 
 Example aggressive configuration:
 
 ```bash
-BIT_SCAN_V3_BATCH_SIZE=2097152 \
-BIT_SCAN_V3_VERIFY_THREADS=15 \
-BIT_SCAN_V3_ITEMS_PER_THREAD=128 \
+BIT_SCAN_V3_BATCH_SIZE=262144 \
+BIT_SCAN_V3_ITEMS_PER_THREAD=8 \
+BIT_SCAN_V3_BLOCK_SIZE=256 \
 cargo run --release -- scan --version v3 --stats 71
 ```
 
-If CUDA support is missing at build or runtime, version 3 automatically falls back to the multi-threaded CPU (`v4`) implementation.
+Observed on this machine: the full-GPU `v3` path sustained roughly `~450k/s` on puzzle `71`, `nvidia-smi pmon` reported `sm 99%`, and the process used roughly one CPU core instead of saturating many CPU threads.
+
+If the OpenCL full-GPU path is unavailable at runtime, `v3` falls back to the older CUDA hybrid path, and then to the multi-threaded CPU engine (`v4`) if CUDA is also unavailable.
 
 ## Found wallets
 
