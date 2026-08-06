@@ -18,8 +18,8 @@ mod cuda {
     use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
     use crate::utils::{
-        extract_hash160_from_base58_address, hash160, number_to_private_key,
-        private_to_compressed_pubkey, save_private_key_to_file,
+        extract_hash160_from_base58_address, hash160, normalize_number_to_bit_length,
+        number_to_private_key, private_to_compressed_pubkey, save_private_key_to_file,
     };
 
     const FUNC_NAME: &str = "fill_randoms";
@@ -194,7 +194,10 @@ extern "C" __global__ void fill_randoms(
                     .par_iter()
                     .zip(host_lo.par_iter())
                     .find_map_any(|(&hi, &lo)| {
-                        let num = ((hi as u128) << 64) | (lo as u128);
+                        let num = normalize_number_to_bit_length(
+                            ((hi as u128) << 64) | (lo as u128),
+                            bits,
+                        );
                         let private_key = number_to_private_key(num);
                         let public_key = private_to_compressed_pubkey(&private_key);
                         let derived_pubkey = hash160(&public_key);

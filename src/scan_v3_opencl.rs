@@ -80,11 +80,11 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
     let mut total_candidates: u64 = 0;
     let mut window_candidates: u64 = 0;
     let mut last_report = Instant::now();
-    let work_items = config.work_items();
+    let launch_shape = config.launch_shape(bits);
     let zero_flag = [0u32];
 
     loop {
-        let base = sample_batch_base(bits, config.batch_size as u32, &mut rng);
+        let base = sample_batch_base(bits, launch_shape.candidate_count, &mut rng);
         let base_words = u128_to_le_words(base);
 
         unsafe {
@@ -97,11 +97,11 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
             launch
                 .set_arg(&base_key_buffer)
                 .set_arg(&target_hash_buffer)
-                .set_arg(&(config.loop_count as cl_uint))
+                .set_arg(&(launch_shape.loop_count as cl_uint))
                 .set_arg(&found_flag_buffer)
                 .set_arg(&found_key_buffer)
-                .set_global_work_size(work_items);
-            if config.work_group_size > 0 && work_items % config.work_group_size == 0 {
+                .set_global_work_size(launch_shape.work_items);
+            if config.work_group_size > 0 && launch_shape.work_items % config.work_group_size == 0 {
                 launch.set_local_work_size(config.work_group_size);
             }
             launch.enqueue_nd_range(&queue)?;
@@ -112,8 +112,8 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
             queue.enqueue_read_buffer(&found_flag_buffer, CL_BLOCKING, 0, &mut found_flag, &[])?;
         }
 
-        total_candidates += config.batch_size as u64;
-        window_candidates += config.batch_size as u64;
+        total_candidates += launch_shape.candidate_count as u64;
+        window_candidates += launch_shape.candidate_count as u64;
 
         if stats {
             maybe_report_stats(&mut last_report, &mut window_candidates, total_candidates);
@@ -181,9 +181,29 @@ impl OpenClScanConfig {
         })
     }
 
-    fn work_items(self) -> usize {
-        self.batch_size / self.loop_count as usize
+    fn launch_shape(self, bits: u32) -> OpenClLaunchShape {
+        let keyspace_size = 1u128 << (bits - 1);
+        let candidate_count = (self.batch_size as u128).min(keyspace_size) as usize;
+        let requested_loop_count = self.loop_count as usize;
+        let loop_count = if candidate_count.is_multiple_of(requested_loop_count) {
+            self.loop_count
+        } else {
+            1
+        };
+
+        OpenClLaunchShape {
+            candidate_count,
+            loop_count,
+            work_items: candidate_count / loop_count as usize,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenClLaunchShape {
+    candidate_count: usize,
+    loop_count: u32,
+    work_items: usize,
 }
 
 fn ensure_opencl_runtime_path() {
@@ -211,20 +231,16 @@ fn ensure_opencl_runtime_path() {
     }
 }
 
-fn sample_batch_base(bits: u32, batch_size: u32, rng: &mut impl Rng) -> u128 {
-    let span = batch_size.saturating_sub(1) as u128;
-
-    if bits == 128 {
-        let mut base = rng.r#gen::<u128>() | (1u128 << 127);
-        if base > u128::MAX - span {
-            base = base.saturating_sub(span);
-        }
-        return base;
-    }
-
+fn sample_batch_base(bits: u32, candidate_count: usize, rng: &mut impl Rng) -> u128 {
+    debug_assert!(candidate_count > 0);
+    let span = candidate_count.saturating_sub(1) as u128;
     let min = 1u128 << (bits - 1);
-    let max_exclusive = 1u128 << bits;
-    let max_base = max_exclusive.saturating_sub(span + 1).max(min);
+    let max = if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    let max_base = max - span;
     rng.gen_range(min..=max_base)
 }
 
@@ -343,4 +359,63 @@ fn find_opencl_loader_in_nix_store() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OpenClScanConfig, sample_batch_base};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    const WIDTHS: [u32; 14] = [1, 7, 8, 9, 31, 32, 63, 64, 65, 70, 71, 72, 127, 128];
+
+    fn test_config() -> OpenClScanConfig {
+        OpenClScanConfig {
+            batch_size: 262_144,
+            loop_count: 8,
+            work_group_size: 256,
+            device_index: 0,
+        }
+    }
+
+    #[test]
+    fn launch_shape_never_exceeds_the_requested_bit_keyspace() {
+        let config = test_config();
+
+        for bits in WIDTHS {
+            let shape = config.launch_shape(bits);
+            let keyspace_size = 1u128 << (bits - 1);
+
+            assert!(shape.candidate_count > 0);
+            assert!(shape.candidate_count as u128 <= keyspace_size);
+            assert_eq!(
+                shape.work_items * shape.loop_count as usize,
+                shape.candidate_count
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_opencl_batch_stays_inside_the_exact_bit_interval() {
+        let config = test_config();
+        let mut rng = StdRng::seed_from_u64(0x0c1);
+
+        for bits in WIDTHS {
+            let shape = config.launch_shape(bits);
+            let min = 1u128 << (bits - 1);
+            let max = if bits == 128 {
+                u128::MAX
+            } else {
+                (1u128 << bits) - 1
+            };
+
+            for _ in 0..64 {
+                let base = sample_batch_base(bits, shape.candidate_count, &mut rng);
+                let last = base + shape.candidate_count as u128 - 1;
+                assert!(base >= min);
+                assert!(last <= max);
+                assert_eq!(u128::BITS - base.leading_zeros(), bits);
+                assert_eq!(u128::BITS - last.leading_zeros(), bits);
+            }
+        }
+    }
 }

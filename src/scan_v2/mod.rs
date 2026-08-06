@@ -51,8 +51,10 @@ mod tests {
     fn generator_respects_bit_length() {
         let mut generator = PatternGenerator::new();
         let mut rng = StdRng::seed_from_u64(42);
-        let value = generator.generate(&mut rng, 71);
-        assert_eq!(71, 128 - value.leading_zeros());
+        for bits in [1, 7, 8, 9, 63, 64, 65, 70, 71, 72, 127, 128] {
+            let value = generator.generate(&mut rng, bits);
+            assert_eq!(bits, 128 - value.leading_zeros());
+        }
     }
 
     #[test]

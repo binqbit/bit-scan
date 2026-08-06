@@ -1,25 +1,22 @@
 use std::time::{Duration, Instant};
 
-use rand::Rng;
-
 use crate::utils::{
     extract_hash160_from_base58_address, hash160, number_to_private_key,
-    private_to_compressed_pubkey, save_private_key_to_file,
+    private_to_compressed_pubkey, random_number_with_bit_length, save_private_key_to_file,
 };
 
 pub fn scan(pubkey: &str, bits: u32, stats: bool) {
+    assert!((1..=128).contains(&bits), "bits must be between 1 and 128");
     let pubkey_hash = extract_hash160_from_base58_address(pubkey);
 
     let mut rng = rand::thread_rng();
-    let min = 2u128.pow(bits - 1);
-    let max = 2u128.pow(bits);
 
     let mut total_candidates: u64 = 0;
     let mut window_candidates: u64 = 0;
     let mut last_report = Instant::now();
 
     loop {
-        let num: u128 = rng.gen_range(min..=max);
+        let num = random_number_with_bit_length(&mut rng, bits);
 
         let private_key = number_to_private_key(num);
         let public_key = private_to_compressed_pubkey(&private_key);

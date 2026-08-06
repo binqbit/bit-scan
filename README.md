@@ -10,11 +10,12 @@ bit-scan check <address> <private_key>
 ```
 
 - `scan` searches for the private key that matches the given Base58 Bitcoin address.
-- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` CUDA batch, `v4` multi-threaded CPU).
+- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` OpenCL-first GPU with CUDA/CPU fallbacks, `v4` multi-threaded CPU).
 - `--threads` sets the worker pool size (required when `--version v4` is selected).
 - `--stats` prints a rolling throughput report once per second (candidates per second plus cumulative total).
 - `target` can be either a Bitcoin address **or** the puzzle number listed in the table below.
 - Bit length is inferred from the target (puzzle numbers supply their own size).
+- Every generated candidate has exactly that bit length: unused high bits are cleared and bit `N-1` is set, keeping an `N`-bit scan inside `[2^(N-1), 2^N)`.
 - `private_key` for `check` accepts up to 64 hex characters (optionally prefixed with `0x`); shorter inputs are left-padded with zeros.
 
 ## Example
