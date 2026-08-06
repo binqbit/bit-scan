@@ -49,27 +49,22 @@ cargo build --release --features cuda
 ```
 
 Requirements:
-- NVIDIA GPU with a recent driver.
-- CUDA toolkit installed (`CUDA_PATH`, `CUDA_ROOT`, or `CUDA_TOOLKIT_ROOT_DIR` must point to it).
-- OpenCL loader available at runtime. On Nix-based systems the scanner auto-discovers `ocl-icd` from `/nix/store`.
+- A GPU with a working OpenCL driver and loader for the full-GPU path. On Nix-based systems the scanner auto-discovers `ocl-icd` from `/nix/store`.
+- An NVIDIA GPU with a recent driver and a CUDA toolkit (`CUDA_PATH`, `CUDA_ROOT`, or `CUDA_TOOLKIT_ROOT_DIR`) only when the CUDA fallback is enabled.
 
-Runtime tuning knobs for `v3`:
-- `BIT_SCAN_V3_BATCH_SIZE` sets candidates per GPU batch. Larger batches use more VRAM and RAM.
-- `BIT_SCAN_V3_ITEMS_PER_THREAD` sets how many adjacent candidates each GPU work-item processes before the next launch.
-- `BIT_SCAN_V3_BLOCK_SIZE` sets the GPU local work size / workgroup size.
-- `BIT_SCAN_V3_OPENCL_DEVICE_INDEX` selects the OpenCL GPU device index for the full-GPU path.
-- `BIT_SCAN_V3_VERIFY_THREADS` only affects the legacy CUDA fallback path.
+`v3` configures itself from the available hardware; it has no manual batch, block, work-item, device-index, or verifier-thread settings. The OpenCL path:
 
-Example aggressive configuration:
+- selects the available GPU with the highest compute-unit/clock score;
+- derives its global and local work sizes from the device limits and the limits of the compiled kernel;
+- profiles each launch and adapts the amount of work per item toward a stable kernel duration.
+
+The CUDA fallback selects the device with the highest multiprocessor/clock score, asks the CUDA occupancy API for its grid and block dimensions, and uses all CPU threads reported by `available_parallelism()` for host-side verification. With `--stats`, the selected device and calculated launch shape are printed at startup.
+
+Run the automatically configured engine with:
 
 ```bash
-BIT_SCAN_V3_BATCH_SIZE=262144 \
-BIT_SCAN_V3_ITEMS_PER_THREAD=8 \
-BIT_SCAN_V3_BLOCK_SIZE=256 \
 cargo run --release -- scan --version v3 --stats 71
 ```
-
-Observed on this machine: the full-GPU `v3` path sustained roughly `~450k/s` on puzzle `71`, `nvidia-smi pmon` reported `sm 99%`, and the process used roughly one CPU core instead of saturating many CPU threads.
 
 If the OpenCL full-GPU path is unavailable at runtime, `v3` falls back to the older CUDA hybrid path, and then to the multi-threaded CPU engine (`v4`) if CUDA is also unavailable.
 

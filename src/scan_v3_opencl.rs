@@ -11,6 +11,7 @@ use opencl3::{
     command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue},
     context::Context,
     device::{CL_DEVICE_TYPE_GPU, Device, get_all_devices},
+    event::Event,
     kernel::{ExecuteKernel, Kernel},
     memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE},
     program::Program,
@@ -20,18 +21,30 @@ use rand::Rng;
 
 use crate::utils::{extract_hash160_from_base58_address, save_private_key_to_file};
 
-const DEFAULT_BATCH_SIZE: usize = 262_144;
-const DEFAULT_LOOP_COUNT: u32 = 8;
-const DEFAULT_WORK_GROUP_SIZE: usize = 256;
 const MAX_KERNEL_SPAN: usize = u32::MAX as usize;
+const TARGET_KERNEL_TIME_NS: u64 = 250_000_000;
 const KERNEL_NAME: &str = "bit_scan_match_kernel";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OpenClScanConfig {
-    batch_size: usize,
+    compute_units: usize,
+    work_items: usize,
+    local_work_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenClHardwareLimits {
+    compute_units: usize,
+    device_max_work_group_size: usize,
+    device_max_work_item_size_x: usize,
+    kernel_max_work_group_size: usize,
+    preferred_work_group_multiple: usize,
+    compile_work_group_size: [usize; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KernelTimeController {
     loop_count: u32,
-    work_group_size: usize,
-    device_index: usize,
 }
 
 pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> {
@@ -39,13 +52,9 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
 
     ensure_opencl_runtime_path();
 
-    let config = OpenClScanConfig::from_env()?;
     let target_hash = extract_hash160_from_base58_address(pubkey);
 
-    let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU)?
-        .get(config.device_index)
-        .ok_or_else(|| format!("OpenCL GPU device {} not found", config.device_index))?;
-    let device = Device::new(device_id);
+    let device = select_opencl_device()?;
     let context = Context::from_device(&device)?;
     let queue =
         CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)?;
@@ -53,9 +62,20 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
     let vendor_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/opencl");
     let kernel_source = load_opencl_source(&vendor_root)?;
     let build_opts = "-cl-std=CL1.2";
-    let program = Program::create_and_build_from_source(&context, &kernel_source, &build_opts)
+    let program = Program::create_and_build_from_source(&context, &kernel_source, build_opts)
         .map_err(|err| format!("OpenCL program build failed: {err}"))?;
     let kernel = Kernel::create(&program, KERNEL_NAME)?;
+    let config = OpenClScanConfig::from_hardware(query_hardware_limits(&device, &kernel)?)?;
+
+    if stats {
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "unknown OpenCL GPU".to_string());
+        println!(
+            "scan_v3: OpenCL auto-selected {device_name}; compute units {}, work-items {}, local size {}, adaptive batch",
+            config.compute_units, config.work_items, config.local_work_size
+        );
+    }
 
     let mut base_key_buffer =
         unsafe { Buffer::<cl_uint>::create(&context, CL_MEM_READ_ONLY, 8, ptr::null_mut())? };
@@ -80,10 +100,11 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
     let mut total_candidates: u64 = 0;
     let mut window_candidates: u64 = 0;
     let mut last_report = Instant::now();
-    let launch_shape = config.launch_shape(bits);
+    let mut controller = KernelTimeController::new();
     let zero_flag = [0u32];
 
     loop {
+        let launch_shape = config.launch_shape(bits, controller.loop_count);
         let base = sample_batch_base(bits, launch_shape.candidate_count, &mut rng);
         let base_words = u128_to_le_words(base);
 
@@ -92,7 +113,8 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
             queue.enqueue_write_buffer(&mut found_flag_buffer, CL_BLOCKING, 0, &zero_flag, &[])?;
         }
 
-        unsafe {
+        let host_kernel_start = Instant::now();
+        let kernel_event = unsafe {
             let mut launch = ExecuteKernel::new(&kernel);
             launch
                 .set_arg(&base_key_buffer)
@@ -101,11 +123,16 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
                 .set_arg(&found_flag_buffer)
                 .set_arg(&found_key_buffer)
                 .set_global_work_size(launch_shape.work_items);
-            if config.work_group_size > 0 && launch_shape.work_items % config.work_group_size == 0 {
-                launch.set_local_work_size(config.work_group_size);
+            if let Some(local_work_size) = launch_shape.local_work_size {
+                launch.set_local_work_size(local_work_size);
             }
-            launch.enqueue_nd_range(&queue)?;
-        }
+            launch.enqueue_nd_range(&queue)?
+        };
+        kernel_event.wait()?;
+        controller.observe(
+            launch_shape.loop_count,
+            kernel_elapsed_ns(&kernel_event, host_kernel_start.elapsed()),
+        );
 
         let mut found_flag = [0u32];
         unsafe {
@@ -146,56 +173,108 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
 }
 
 impl OpenClScanConfig {
-    fn from_env() -> Result<Self, Box<dyn Error>> {
-        let batch_size = parse_env_usize("BIT_SCAN_V3_BATCH_SIZE")
-            .unwrap_or(DEFAULT_BATCH_SIZE)
-            .max(1);
-        let loop_count = parse_env_u32("BIT_SCAN_V3_ITEMS_PER_THREAD")
-            .or_else(|| parse_env_u32("BIT_SCAN_V3_LOOP_COUNT"))
-            .unwrap_or(DEFAULT_LOOP_COUNT)
-            .max(1);
-        let work_group_size = parse_env_usize("BIT_SCAN_V3_BLOCK_SIZE")
-            .unwrap_or(DEFAULT_WORK_GROUP_SIZE)
-            .max(1);
-        let device_index = parse_env_usize("BIT_SCAN_V3_OPENCL_DEVICE_INDEX").unwrap_or(0);
+    fn from_hardware(limits: OpenClHardwareLimits) -> Result<Self, String> {
+        if limits.compute_units == 0 {
+            return Err("OpenCL reported zero compute units".to_string());
+        }
+        if limits.device_max_work_group_size == 0
+            || limits.device_max_work_item_size_x == 0
+            || limits.kernel_max_work_group_size == 0
+        {
+            return Err("OpenCL reported a zero work-group limit".to_string());
+        }
+        if limits.preferred_work_group_multiple == 0 {
+            return Err("OpenCL reported a zero preferred work-group multiple".to_string());
+        }
 
-        if batch_size > MAX_KERNEL_SPAN {
-            return Err(format!(
-                "BIT_SCAN_V3_BATCH_SIZE={} exceeds the OpenCL kernel span limit of {}",
-                batch_size, MAX_KERNEL_SPAN
-            )
-            .into());
+        let hard_local_limit = limits
+            .device_max_work_group_size
+            .min(limits.device_max_work_item_size_x)
+            .min(limits.kernel_max_work_group_size);
+        let compiled = limits.compile_work_group_size;
+        let local_work_size = if compiled[0] > 0 {
+            if compiled[1] > 1 || compiled[2] > 1 {
+                return Err(format!(
+                    "OpenCL kernel requires a non-1D work-group of {compiled:?}"
+                ));
+            }
+            if compiled[0] > hard_local_limit {
+                return Err(format!(
+                    "OpenCL kernel requires local size {}, above the hardware limit {hard_local_limit}",
+                    compiled[0]
+                ));
+            }
+            compiled[0]
+        } else {
+            let aligned =
+                hard_local_limit - (hard_local_limit % limits.preferred_work_group_multiple);
+            if aligned == 0 {
+                hard_local_limit
+            } else {
+                aligned
+            }
+        };
+
+        let target_work_items = limits
+            .compute_units
+            .checked_mul(limits.device_max_work_group_size)
+            .ok_or_else(|| "OpenCL hardware work-item count overflowed usize".to_string())?;
+        let max_aligned_work_items = (MAX_KERNEL_SPAN / local_work_size) * local_work_size;
+        if max_aligned_work_items == 0 {
+            return Err("OpenCL local size exceeds the kernel span".to_string());
         }
-        if batch_size % loop_count as usize != 0 {
-            return Err(format!(
-                "BIT_SCAN_V3_BATCH_SIZE ({batch_size}) must be divisible by BIT_SCAN_V3_ITEMS_PER_THREAD ({loop_count})"
-            )
-            .into());
-        }
+        let work_items = if target_work_items >= max_aligned_work_items {
+            max_aligned_work_items
+        } else {
+            round_up_to_multiple(target_work_items, local_work_size)
+                .ok_or_else(|| "OpenCL work-item alignment overflowed usize".to_string())?
+        };
 
         Ok(Self {
-            batch_size,
-            loop_count,
-            work_group_size,
-            device_index,
+            compute_units: limits.compute_units,
+            work_items,
+            local_work_size,
         })
     }
 
-    fn launch_shape(self, bits: u32) -> OpenClLaunchShape {
+    fn launch_shape(self, bits: u32, requested_loop_count: u32) -> OpenClLaunchShape {
         let keyspace_size = 1u128 << (bits - 1);
-        let candidate_count = (self.batch_size as u128).min(keyspace_size) as usize;
-        let requested_loop_count = self.loop_count as usize;
-        let loop_count = if candidate_count.is_multiple_of(requested_loop_count) {
-            self.loop_count
-        } else {
-            1
-        };
+        let work_items = (self.work_items as u128).min(keyspace_size) as usize;
+        let candidate_limit = keyspace_size.min(MAX_KERNEL_SPAN as u128);
+        let max_loop_count = (candidate_limit / work_items as u128)
+            .min(u32::MAX as u128)
+            .max(1) as u32;
+        let loop_count = requested_loop_count.clamp(1, max_loop_count);
+        let candidate_count = work_items * loop_count as usize;
+        let local_work_size = work_items
+            .is_multiple_of(self.local_work_size)
+            .then_some(self.local_work_size);
 
         OpenClLaunchShape {
             candidate_count,
             loop_count,
-            work_items: candidate_count / loop_count as usize,
+            work_items,
+            local_work_size,
         }
+    }
+}
+
+impl KernelTimeController {
+    const fn new() -> Self {
+        Self { loop_count: 1 }
+    }
+
+    fn observe(&mut self, actual_loop_count: u32, elapsed_ns: u64) {
+        if elapsed_ns == 0 {
+            return;
+        }
+
+        let proportional = (u128::from(actual_loop_count) * u128::from(TARGET_KERNEL_TIME_NS))
+            .div_ceil(u128::from(elapsed_ns))
+            .clamp(1, u128::from(u32::MAX)) as u32;
+        let lower = (actual_loop_count / 2).max(1);
+        let upper = actual_loop_count.saturating_mul(2).max(1);
+        self.loop_count = proportional.clamp(lower, upper);
     }
 }
 
@@ -204,6 +283,96 @@ struct OpenClLaunchShape {
     candidate_count: usize,
     loop_count: u32,
     work_items: usize,
+    local_work_size: Option<usize>,
+}
+
+fn query_hardware_limits(
+    device: &Device,
+    kernel: &Kernel,
+) -> Result<OpenClHardwareLimits, Box<dyn Error>> {
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "unknown OpenCL GPU".to_string());
+    let work_item_sizes = device
+        .max_work_item_sizes()
+        .map_err(|err| format!("failed to query work-item limits for {device_name}: {err}"))?;
+    let compile_work_group_size =
+        kernel
+            .get_compile_work_group_size(device.id())
+            .map_err(|err| {
+                format!("failed to query compiled work-group size for {device_name}: {err}")
+            })?;
+
+    let device_max_work_item_size_x = *work_item_sizes
+        .first()
+        .ok_or_else(|| format!("OpenCL returned no work-item limits for {device_name}"))?;
+    if compile_work_group_size.len() < 3 {
+        return Err(format!(
+            "OpenCL returned an invalid compiled work-group shape for {device_name}"
+        )
+        .into());
+    }
+
+    Ok(OpenClHardwareLimits {
+        compute_units: usize::try_from(device.max_compute_units()?)?,
+        device_max_work_group_size: device.max_work_group_size()?,
+        device_max_work_item_size_x,
+        kernel_max_work_group_size: kernel.get_work_group_size(device.id())?,
+        preferred_work_group_multiple: kernel.get_work_group_size_multiple(device.id())?,
+        compile_work_group_size: [
+            compile_work_group_size[0],
+            compile_work_group_size[1],
+            compile_work_group_size[2],
+        ],
+    })
+}
+
+fn select_opencl_device() -> Result<Device, Box<dyn Error>> {
+    let device_ids = get_all_devices(CL_DEVICE_TYPE_GPU)?;
+    let mut best = None;
+
+    for (ordinal, device_id) in device_ids.into_iter().enumerate() {
+        let device = Device::new(device_id);
+        if !device.available().unwrap_or(false) || !device.compiler_available().unwrap_or(false) {
+            continue;
+        }
+
+        let Ok(compute_units) = device.max_compute_units() else {
+            continue;
+        };
+        let clock_rate = device.max_clock_frequency().unwrap_or(1).max(1);
+        let global_memory = device.global_mem_size().unwrap_or(0);
+        let score = u64::from(compute_units) * u64::from(clock_rate);
+
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, best_memory, best_ordinal, _)| {
+                (score, global_memory, usize::MAX - ordinal)
+                    > (*best_score, *best_memory, usize::MAX - *best_ordinal)
+            })
+        {
+            best = Some((score, global_memory, ordinal, device_id));
+        }
+    }
+
+    best.map(|(_, _, _, device_id)| Device::new(device_id))
+        .ok_or_else(|| "no available OpenCL GPU with a compiler was found".into())
+}
+
+fn round_up_to_multiple(value: usize, multiple: usize) -> Option<usize> {
+    value
+        .checked_add(multiple.checked_sub(1)?)
+        .map(|rounded| (rounded / multiple) * multiple)
+}
+
+fn kernel_elapsed_ns(event: &Event, host_elapsed: Duration) -> u64 {
+    event
+        .profiling_command_start()
+        .ok()
+        .zip(event.profiling_command_end().ok())
+        .and_then(|(start, end)| end.checked_sub(start))
+        .filter(|elapsed| *elapsed > 0)
+        .unwrap_or_else(|| u64::try_from(host_elapsed.as_nanos()).unwrap_or(u64::MAX))
 }
 
 fn ensure_opencl_runtime_path() {
@@ -297,14 +466,6 @@ fn flush_stats(last_report: Instant, window_candidates: u64, total_candidates: u
     }
 }
 
-fn parse_env_usize(key: &str) -> Option<usize> {
-    env::var(key).ok()?.parse().ok()
-}
-
-fn parse_env_u32(key: &str) -> Option<u32> {
-    env::var(key).ok()?.parse().ok()
-}
-
 fn load_opencl_source(vendor_root: &Path) -> Result<String, Box<dyn Error>> {
     let resources = [
         "inc_defines.h",
@@ -363,18 +524,88 @@ fn find_opencl_loader_in_nix_store() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenClScanConfig, sample_batch_base};
+    use super::{
+        KernelTimeController, OpenClHardwareLimits, OpenClScanConfig, TARGET_KERNEL_TIME_NS,
+        round_up_to_multiple, sample_batch_base,
+    };
     use rand::{SeedableRng, rngs::StdRng};
 
     const WIDTHS: [u32; 14] = [1, 7, 8, 9, 31, 32, 63, 64, 65, 70, 71, 72, 127, 128];
 
-    fn test_config() -> OpenClScanConfig {
-        OpenClScanConfig {
-            batch_size: 262_144,
-            loop_count: 8,
-            work_group_size: 256,
-            device_index: 0,
+    fn test_limits() -> OpenClHardwareLimits {
+        OpenClHardwareLimits {
+            compute_units: 20,
+            device_max_work_group_size: 1_024,
+            device_max_work_item_size_x: 1_024,
+            kernel_max_work_group_size: 256,
+            preferred_work_group_multiple: 32,
+            compile_work_group_size: [0, 0, 0],
         }
+    }
+
+    fn test_config() -> OpenClScanConfig {
+        OpenClScanConfig::from_hardware(test_limits()).unwrap()
+    }
+
+    #[test]
+    fn hardware_limits_determine_opencl_parallelism() {
+        let config = test_config();
+
+        assert_eq!(config.compute_units, 20);
+        assert_eq!(config.local_work_size, 256);
+        assert_eq!(config.work_items, 20 * 1_024);
+    }
+
+    #[test]
+    fn local_size_respects_preferred_multiple_and_compiled_shape() {
+        let rounded = OpenClScanConfig::from_hardware(OpenClHardwareLimits {
+            kernel_max_work_group_size: 250,
+            ..test_limits()
+        })
+        .unwrap();
+        assert_eq!(rounded.local_work_size, 224);
+        assert_eq!(rounded.work_items % rounded.local_work_size, 0);
+
+        let compiled = OpenClScanConfig::from_hardware(OpenClHardwareLimits {
+            compile_work_group_size: [128, 1, 1],
+            ..test_limits()
+        })
+        .unwrap();
+        assert_eq!(compiled.local_work_size, 128);
+
+        assert!(
+            OpenClScanConfig::from_hardware(OpenClHardwareLimits {
+                compile_work_group_size: [128, 2, 1],
+                ..test_limits()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_or_overflowing_hardware_limits_are_rejected() {
+        assert!(
+            OpenClScanConfig::from_hardware(OpenClHardwareLimits {
+                compute_units: 0,
+                ..test_limits()
+            })
+            .is_err()
+        );
+        assert!(
+            OpenClScanConfig::from_hardware(OpenClHardwareLimits {
+                preferred_work_group_multiple: 0,
+                ..test_limits()
+            })
+            .is_err()
+        );
+        assert!(
+            OpenClScanConfig::from_hardware(OpenClHardwareLimits {
+                compute_units: usize::MAX,
+                device_max_work_group_size: 2,
+                ..test_limits()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -382,7 +613,7 @@ mod tests {
         let config = test_config();
 
         for bits in WIDTHS {
-            let shape = config.launch_shape(bits);
+            let shape = config.launch_shape(bits, 8);
             let keyspace_size = 1u128 << (bits - 1);
 
             assert!(shape.candidate_count > 0);
@@ -391,6 +622,9 @@ mod tests {
                 shape.work_items * shape.loop_count as usize,
                 shape.candidate_count
             );
+            if let Some(local_work_size) = shape.local_work_size {
+                assert_eq!(shape.work_items % local_work_size, 0);
+            }
         }
     }
 
@@ -400,7 +634,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0x0c1);
 
         for bits in WIDTHS {
-            let shape = config.launch_shape(bits);
+            let shape = config.launch_shape(bits, 8);
             let min = 1u128 << (bits - 1);
             let max = if bits == 128 {
                 u128::MAX
@@ -417,5 +651,27 @@ mod tests {
                 assert_eq!(u128::BITS - last.leading_zeros(), bits);
             }
         }
+    }
+
+    #[test]
+    fn kernel_time_controller_converges_without_large_jumps() {
+        let mut controller = KernelTimeController::new();
+
+        controller.observe(1, TARGET_KERNEL_TIME_NS / 4);
+        assert_eq!(controller.loop_count, 2);
+
+        controller.observe(2, TARGET_KERNEL_TIME_NS * 4);
+        assert_eq!(controller.loop_count, 1);
+
+        controller.observe(1, 0);
+        assert_eq!(controller.loop_count, 1);
+    }
+
+    #[test]
+    fn alignment_helper_checks_overflow() {
+        assert_eq!(round_up_to_multiple(20_480, 256), Some(20_480));
+        assert_eq!(round_up_to_multiple(20_481, 256), Some(20_736));
+        assert_eq!(round_up_to_multiple(1, 0), None);
+        assert_eq!(round_up_to_multiple(usize::MAX, 2), None);
     }
 }
