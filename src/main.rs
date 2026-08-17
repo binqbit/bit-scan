@@ -4,9 +4,10 @@ mod scan_v2;
 mod scan_v3;
 mod scan_v3_opencl;
 mod scan_v4;
+mod scan_v5;
 pub mod utils;
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU128, NonZeroUsize};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -32,6 +33,12 @@ enum Commands {
         /// Number of worker threads (required for version v4)
         #[arg(long, value_name = "COUNT")]
         threads: Option<NonZeroUsize>,
+        /// SEC-encoded public key hex, required for version v5 kangaroo scanning
+        #[arg(long = "public-key", value_name = "SEC_HEX")]
+        public_key: Option<String>,
+        /// Restrict version v5 to private keys divisible by this value
+        #[arg(long = "multiple-of", value_name = "N", default_value_t = NonZeroU128::new(1).unwrap())]
+        multiple_of: NonZeroU128,
     },
     /// Validate that a private key matches a wallet address
     Check {
@@ -48,6 +55,7 @@ enum ScanVersion {
     V2,
     V3,
     V4,
+    V5,
 }
 
 fn main() {
@@ -60,6 +68,8 @@ fn main() {
             stats,
             address,
             threads,
+            public_key,
+            multiple_of,
         } => {
             let resolved = match utils::resolve_target(&address) {
                 Ok(res) => res,
@@ -70,6 +80,13 @@ fn main() {
             };
 
             let effective_bits = resolved.suggested_bits.unwrap_or_else(|| {
+                if version == ScanVersion::V5 {
+                    if let Ok(number) = address.parse::<u32>() {
+                        if (1..=160).contains(&number) {
+                            return number;
+                        }
+                    }
+                }
                 eprintln!(
                     "Unable to infer bit length for target \"{address}\". \
                      Please add it to config/puzzle_addresses.csv."
@@ -79,6 +96,14 @@ fn main() {
 
             if version != ScanVersion::V4 && threads.is_some() {
                 eprintln!("--threads is only supported when --version v4 is selected");
+                std::process::exit(5);
+            }
+            if version != ScanVersion::V5 && public_key.is_some() {
+                eprintln!("--public-key is only supported when --version v5 is selected");
+                std::process::exit(5);
+            }
+            if version != ScanVersion::V5 && multiple_of.get() != 1 {
+                eprintln!("--multiple-of is only supported when --version v5 is selected");
                 std::process::exit(5);
             }
 
@@ -92,6 +117,24 @@ fn main() {
                         std::process::exit(6);
                     });
                     scan_v4::scan(&resolved.address, effective_bits, stats, thread_count);
+                }
+                ScanVersion::V5 => {
+                    let public_key = public_key.unwrap_or_else(|| {
+                        eprintln!(
+                            "--public-key <SEC_HEX> is required when --version v5 is selected"
+                        );
+                        std::process::exit(6);
+                    });
+                    if let Err(err) = scan_v5::scan(
+                        &resolved.address,
+                        effective_bits,
+                        stats,
+                        &public_key,
+                        multiple_of,
+                    ) {
+                        eprintln!("{err}");
+                        std::process::exit(7);
+                    }
                 }
             }
         }

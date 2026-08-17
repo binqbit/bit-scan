@@ -5,13 +5,15 @@ A simple utility for searching Bitcoin wallets [Bitcoin Puzzle Transaction](http
 ## Usage
 
 ```bash
-bit-scan scan [--version <v1|v2|v3|v4>] [--stats] [--threads <count>] <target>
+bit-scan scan [--version <v1|v2|v3|v4|v5>] [--stats] [--threads <count>] [--public-key <sec_hex>] [--multiple-of <n>] <target>
 bit-scan check <address> <private_key>
 ```
 
 - `scan` searches for the private key that matches the given Base58 Bitcoin address.
-- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` OpenCL-first GPU with CUDA/CPU fallbacks, `v4` multi-threaded CPU).
+- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` OpenCL-first GPU with CUDA/CPU fallbacks, `v4` multi-threaded CPU, `v5` Pollard kangaroo for known public keys).
 - `--threads` sets the worker pool size (required when `--version v4` is selected).
+- `--public-key` supplies the compressed or uncompressed SEC public key hex required by `v5`.
+- `--multiple-of` restricts `v5` to keys divisible by `n`; use `2` for even keys, `5` for multiples of five, and `10` when both constraints apply.
 - `--stats` prints a rolling throughput report once per second (candidates per second plus cumulative total).
 - `target` can be either a Bitcoin address **or** the puzzle number listed in the table below.
 - Bit length is inferred from the target (puzzle numbers supply their own size).
@@ -31,6 +33,14 @@ Run the multi-threaded CPU engine on puzzle wallet 10 with eight workers:
 ```bash
 bit-scan scan --version v4 --threads 8 --stats 10
 ```
+
+Run the Pollard kangaroo engine against a puzzle range when the public key is known:
+
+```bash
+bit-scan scan --version v5 --public-key 0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a --multiple-of 5 --stats 85
+```
+
+`v5` currently runs the kangaroo walk on CPU. It solves the interval as an elliptic-curve discrete logarithm, so a P2PKH address alone is not enough: it only contains `HASH160(public_key)`. Provide the actual SEC public key; `v5` verifies that it hashes to the target address before starting.
 
 If you prefer to scan by address, add an entry to `config/puzzle_addresses.csv` so the tool can infer the correct bit length.
 
