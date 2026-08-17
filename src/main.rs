@@ -5,6 +5,7 @@ mod scan_v3;
 mod scan_v3_opencl;
 mod scan_v4;
 mod scan_v5;
+mod scan_v6;
 pub mod utils;
 
 use std::num::{NonZeroU128, NonZeroUsize};
@@ -33,10 +34,10 @@ enum Commands {
         /// Number of worker threads (required for version v4)
         #[arg(long, value_name = "COUNT")]
         threads: Option<NonZeroUsize>,
-        /// SEC-encoded public key hex, required for version v5 kangaroo scanning
+        /// SEC-encoded public key hex, required for version v5/v6 kangaroo scanning
         #[arg(long = "public-key", value_name = "SEC_HEX")]
         public_key: Option<String>,
-        /// Restrict version v5 to private keys divisible by this value
+        /// Restrict version v5/v6 to private keys divisible by this value
         #[arg(long = "multiple-of", value_name = "N", default_value_t = NonZeroU128::new(1).unwrap())]
         multiple_of: NonZeroU128,
     },
@@ -56,6 +57,7 @@ enum ScanVersion {
     V3,
     V4,
     V5,
+    V6,
 }
 
 fn main() {
@@ -80,7 +82,7 @@ fn main() {
             };
 
             let effective_bits = resolved.suggested_bits.unwrap_or_else(|| {
-                if version == ScanVersion::V5 {
+                if matches!(version, ScanVersion::V5 | ScanVersion::V6) {
                     if let Ok(number) = address.parse::<u32>() {
                         if (1..=160).contains(&number) {
                             return number;
@@ -98,12 +100,12 @@ fn main() {
                 eprintln!("--threads is only supported when --version v4 is selected");
                 std::process::exit(5);
             }
-            if version != ScanVersion::V5 && public_key.is_some() {
-                eprintln!("--public-key is only supported when --version v5 is selected");
+            if !matches!(version, ScanVersion::V5 | ScanVersion::V6) && public_key.is_some() {
+                eprintln!("--public-key is only supported when --version v5 or v6 is selected");
                 std::process::exit(5);
             }
-            if version != ScanVersion::V5 && multiple_of.get() != 1 {
-                eprintln!("--multiple-of is only supported when --version v5 is selected");
+            if !matches!(version, ScanVersion::V5 | ScanVersion::V6) && multiple_of.get() != 1 {
+                eprintln!("--multiple-of is only supported when --version v5 or v6 is selected");
                 std::process::exit(5);
             }
 
@@ -126,6 +128,24 @@ fn main() {
                         std::process::exit(6);
                     });
                     if let Err(err) = scan_v5::scan(
+                        &resolved.address,
+                        effective_bits,
+                        stats,
+                        &public_key,
+                        multiple_of,
+                    ) {
+                        eprintln!("{err}");
+                        std::process::exit(7);
+                    }
+                }
+                ScanVersion::V6 => {
+                    let public_key = public_key.unwrap_or_else(|| {
+                        eprintln!(
+                            "--public-key <SEC_HEX> is required when --version v6 is selected"
+                        );
+                        std::process::exit(6);
+                    });
+                    if let Err(err) = scan_v6::scan(
                         &resolved.address,
                         effective_bits,
                         stats,

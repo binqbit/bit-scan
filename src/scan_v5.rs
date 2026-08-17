@@ -20,21 +20,30 @@ const MAX_ATTEMPTS: u64 = 32;
 const DIRECT_SOLVE_LIMIT: u128 = 1_000_000;
 
 #[derive(Clone, Debug)]
-struct Progression {
-    first: BigUint,
-    last: BigUint,
-    step: NonZeroU128,
-    len: BigUint,
+pub(crate) struct KangarooProblem {
+    pub(crate) address: String,
+    pub(crate) public_key: AffinePoint,
+    pub(crate) progression: Progression,
+    pub(crate) base: ProjectivePoint,
+    pub(crate) target: ProjectivePoint,
 }
 
 #[derive(Clone, Debug)]
-struct JumpSet {
-    distances: Vec<BigUint>,
-    points: Vec<ProjectivePoint>,
+pub(crate) struct Progression {
+    pub(crate) first: BigUint,
+    pub(crate) last: BigUint,
+    pub(crate) step: NonZeroU128,
+    pub(crate) len: BigUint,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JumpSet {
+    pub(crate) distances: Vec<BigUint>,
+    pub(crate) points: Vec<ProjectivePoint>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct WalkStats {
+pub(crate) struct WalkStats {
     jumps: u128,
     attempts: u64,
 }
@@ -50,32 +59,36 @@ pub fn scan(
         return Err("bits must be between 1 and 160 for scan_v5".to_string());
     }
 
-    let public_key_bytes = parse_hex(public_key_hex)?;
-    let public_key = parse_public_key(&public_key_bytes)?;
-    validate_public_key_address(address, &public_key_bytes)?;
-
-    let progression = Progression::from_bits(bits, multiple_of)?;
-    let step_scalar = scalar_from_u128(multiple_of.get());
-    let first_scalar = scalar_from_biguint(&progression.first)?;
-    let base = ProjectivePoint::GENERATOR * step_scalar;
-    let target = ProjectivePoint::from(public_key) - (ProjectivePoint::GENERATOR * first_scalar);
+    let problem = prepare_problem(address, bits, public_key_hex, multiple_of)?;
 
     if stats {
         println!(
             "scan_v5: kangaroo interval [{}..={}], step {}, progression candidates {}",
-            progression.first,
-            progression.last,
-            progression.step.get(),
-            progression.len
+            problem.progression.first,
+            problem.progression.last,
+            problem.progression.step.get(),
+            problem.progression.len
         );
     }
 
     let mut stats_state = WalkStats::default();
     let started = Instant::now();
-    let j = if progression.len <= BigUint::from(DIRECT_SOLVE_LIMIT) {
-        solve_direct(target, base, progression.len, stats, &mut stats_state)
+    let j = if problem.progression.len <= BigUint::from(DIRECT_SOLVE_LIMIT) {
+        solve_direct(
+            problem.target,
+            problem.base,
+            problem.progression.len.clone(),
+            stats,
+            &mut stats_state,
+        )
     } else {
-        solve_kangaroo(target, base, progression.len, stats, &mut stats_state)
+        solve_kangaroo(
+            problem.target,
+            problem.base,
+            problem.progression.len.clone(),
+            stats,
+            &mut stats_state,
+        )
     }
     .ok_or_else(|| {
         format!(
@@ -84,9 +97,10 @@ pub fn scan(
         )
     })?;
 
-    let private_value = progression.first + (BigUint::from(progression.step.get()) * j);
+    let private_value =
+        problem.progression.first.clone() + (BigUint::from(problem.progression.step.get()) * j);
 
-    verify_solution(&private_value, public_key, address)?;
+    verify_solution(&private_value, problem.public_key, &problem.address)?;
     let private_key = private_key_from_biguint(&private_value)?;
 
     if stats {
@@ -101,7 +115,43 @@ pub fn scan(
     }
 
     println!("Match found! Private key: {}", hex::encode(private_key));
-    save_private_key_to_file(address, private_key, "found_keys")
+    save_private_key_to_file(&problem.address, private_key, "found_keys")
+        .map_err(|err| format!("Failed to save private key: {err}"))?;
+    Ok(())
+}
+
+pub(crate) fn prepare_problem(
+    address: &str,
+    bits: u32,
+    public_key_hex: &str,
+    multiple_of: NonZeroU128,
+) -> Result<KangarooProblem, String> {
+    let public_key_bytes = parse_hex(public_key_hex)?;
+    let public_key = parse_public_key(&public_key_bytes)?;
+    validate_public_key_address(address, &public_key_bytes)?;
+
+    let progression = Progression::from_bits(bits, multiple_of)?;
+    let step_scalar = scalar_from_u128(multiple_of.get());
+    let first_scalar = scalar_from_biguint(&progression.first)?;
+    let base = ProjectivePoint::GENERATOR * step_scalar;
+    let target = ProjectivePoint::from(public_key) - (ProjectivePoint::GENERATOR * first_scalar);
+
+    Ok(KangarooProblem {
+        address: address.to_owned(),
+        public_key,
+        progression,
+        base,
+        target,
+    })
+}
+
+pub(crate) fn finish_solution(problem: &KangarooProblem, j: BigUint) -> Result<(), String> {
+    let private_value =
+        problem.progression.first.clone() + (BigUint::from(problem.progression.step.get()) * j);
+    verify_solution(&private_value, problem.public_key, &problem.address)?;
+    let private_key = private_key_from_biguint(&private_value)?;
+    println!("Match found! Private key: {}", hex::encode(private_key));
+    save_private_key_to_file(&problem.address, private_key, "found_keys")
         .map_err(|err| format!("Failed to save private key: {err}"))?;
     Ok(())
 }
@@ -181,7 +231,7 @@ fn solve_kangaroo(
 }
 
 impl Progression {
-    fn from_bits(bits: u32, step: NonZeroU128) -> Result<Self, String> {
+    pub(crate) fn from_bits(bits: u32, step: NonZeroU128) -> Result<Self, String> {
         let min = BigUint::one() << (bits - 1);
         let max = (BigUint::one() << bits) - BigUint::one();
         let step_value = step.get();
@@ -211,7 +261,7 @@ impl Progression {
 }
 
 impl JumpSet {
-    fn new(base: ProjectivePoint, len: &BigUint, attempt: u64) -> Self {
+    pub(crate) fn new(base: ProjectivePoint, len: &BigUint, attempt: u64) -> Self {
         let target_mean = ceil_sqrt(len).max(BigUint::from(2u32)) / 2u32;
         let mut count = 2usize;
         while count < 192 && (((BigUint::one() << count) - BigUint::one()) / count) <= target_mean {
@@ -295,7 +345,7 @@ fn scalar_from_u128(value: u128) -> Scalar {
     <Scalar as Reduce<U256>>::reduce_bytes((&bytes).into())
 }
 
-fn scalar_from_biguint(value: &BigUint) -> Result<Scalar, String> {
+pub(crate) fn scalar_from_biguint(value: &BigUint) -> Result<Scalar, String> {
     let bytes_vec = value.to_bytes_be();
     if bytes_vec.len() > 32 {
         return Err("scalar is wider than 256 bits".to_string());
@@ -305,7 +355,7 @@ fn scalar_from_biguint(value: &BigUint) -> Result<Scalar, String> {
     Ok(<Scalar as Reduce<U256>>::reduce_bytes((&bytes).into()))
 }
 
-fn private_key_from_biguint(value: &BigUint) -> Result<[u8; 32], String> {
+pub(crate) fn private_key_from_biguint(value: &BigUint) -> Result<[u8; 32], String> {
     let bytes_vec = value.to_bytes_be();
     if bytes_vec.len() > 32 {
         return Err("private key is wider than 256 bits".to_string());
@@ -315,7 +365,7 @@ fn private_key_from_biguint(value: &BigUint) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
-fn ceil_sqrt(value: &BigUint) -> BigUint {
+pub(crate) fn ceil_sqrt(value: &BigUint) -> BigUint {
     if *value <= BigUint::one() {
         return value.clone();
     }
@@ -338,7 +388,7 @@ fn ceil_sqrt(value: &BigUint) -> BigUint {
     low
 }
 
-fn splitmix64(mut value: u64) -> u64 {
+pub(crate) fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

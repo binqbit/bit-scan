@@ -5,15 +5,15 @@ A simple utility for searching Bitcoin wallets [Bitcoin Puzzle Transaction](http
 ## Usage
 
 ```bash
-bit-scan scan [--version <v1|v2|v3|v4|v5>] [--stats] [--threads <count>] [--public-key <sec_hex>] [--multiple-of <n>] <target>
+bit-scan scan [--version <v1|v2|v3|v4|v5|v6>] [--stats] [--threads <count>] [--public-key <sec_hex>] [--multiple-of <n>] <target>
 bit-scan check <address> <private_key>
 ```
 
 - `scan` searches for the private key that matches the given Base58 Bitcoin address.
-- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` OpenCL-first GPU with CUDA/CPU fallbacks, `v4` multi-threaded CPU, `v5` Pollard kangaroo for known public keys).
+- `--version` picks the scanning engine (`v1` brute force, `v2` pattern-guided, `v3` OpenCL-first GPU with CUDA/CPU fallbacks, `v4` multi-threaded CPU, `v5` CPU Pollard kangaroo for known public keys, `v6` OpenCL GPU Pollard kangaroo).
 - `--threads` sets the worker pool size (required when `--version v4` is selected).
-- `--public-key` supplies the compressed or uncompressed SEC public key hex required by `v5`.
-- `--multiple-of` restricts `v5` to keys divisible by `n`; use `2` for even keys, `5` for multiples of five, and `10` when both constraints apply.
+- `--public-key` supplies the compressed or uncompressed SEC public key hex required by `v5` and `v6`.
+- `--multiple-of` restricts `v5` and `v6` to keys divisible by `n`; keep `1` unless you know the private key is in that arithmetic progression.
 - `--stats` prints a rolling throughput report once per second (candidates per second plus cumulative total).
 - `target` can be either a Bitcoin address **or** the puzzle number listed in the table below.
 - Bit length is inferred from the target (puzzle numbers supply their own size).
@@ -37,10 +37,16 @@ bit-scan scan --version v4 --threads 8 --stats 10
 Run the Pollard kangaroo engine against a puzzle range when the public key is known:
 
 ```bash
-bit-scan scan --version v5 --public-key 0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a --multiple-of 5 --stats 85
+bit-scan scan --version v5 --public-key 0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a --multiple-of 1 --stats 85
 ```
 
-`v5` currently runs the kangaroo walk on CPU. It solves the interval as an elliptic-curve discrete logarithm, so a P2PKH address alone is not enough: it only contains `HASH160(public_key)`. Provide the actual SEC public key; `v5` verifies that it hashes to the target address before starting.
+Run the OpenCL GPU kangaroo engine against puzzle 140:
+
+```bash
+bit-scan scan --version v6 --public-key 031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640 --multiple-of 1 --stats 140
+```
+
+`v5` runs the kangaroo walk on CPU. `v6` runs parallel tame/wild kangaroo walkers on an OpenCL GPU and keeps the distinguished-point collision table on the host. Both solve the interval as an elliptic-curve discrete logarithm, so a P2PKH address alone is not enough: it only contains `HASH160(public_key)`. Provide the actual SEC public key; the scanner verifies that it hashes to the target address before starting.
 
 If you prefer to scan by address, add an entry to `config/puzzle_addresses.csv` so the tool can infer the correct bit length.
 
@@ -226,7 +232,7 @@ If the OpenCL full-GPU path is unavailable at runtime, `v3` falls back to the ol
 | 137 | 1M3jS6X3zVKn3PG1Zup4Z3sYJ8WNgE6Y5t  |                                  | Unsolved |
 | 138 | 1M65fUppgG4yZJ1hN8AtrooSiT3nT4M3uW  |                                  | Unsolved |
 | 139 | 14NSRrsM9fX6TuJ1K3nWKVypY3V3TA4C4Y  |                                  | Unsolved |
-| 140 | 1D7eT6uU1M8k6WaW3pM6G5vXnm3n8n7Cfx  |                                  | Unsolved |
+| 140 | 1QKBaU6WAeycb3DbKbLBkX7vJiaS8r42Xo  |                                  | Unsolved |
 | 141 | 1MNeT6yemMJSd7kt9L1PP2u3eZ8XsDTS3Y  |                                  | Unsolved |
 | 142 | 14yhdGZmW1Z9G3bZ1fY1KX7n7fY1KX7n7f  |                                  | Unsolved |
 | 143 | 1M3jS6X3zVKn3PG1Zup4Z3sYJ8WNgE6Y5t  |                                  | Unsolved |
