@@ -58,7 +58,11 @@ bit-scan check 1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe 000000000000000202
 
 ### GPU engine (v3)
 
-The `v3` engine now prioritizes a full-GPU path: `private key -> secp256k1 public key -> hash160 -> compare` runs on the GPU through OpenCL, with the older CUDA batch generator kept only as a fallback. Build the project with:
+The `v3` engine now prioritizes a full-GPU path: `private key -> secp256k1 public key -> hash160 -> compare` runs on the GPU through OpenCL, with the older CUDA batch generator kept only as a fallback.
+
+Both GPU paths draw one OS-seeded random base per batch on the host and derive candidates as `base + candidate offset`. The base spans the requested width (with the required top bit fixed), and is bounded so the complete batch remains inside the exact bit interval. Random generation is not performed separately for every GPU candidate. Batch bases are independent, so different batches can overlap.
+
+Build the project with:
 
 ```bash
 cargo build --release --features cuda

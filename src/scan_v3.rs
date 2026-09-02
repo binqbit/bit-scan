@@ -14,30 +14,19 @@ mod cuda {
         nvrtc::compile_ptx,
     };
     use libloading::Library;
-    use rand::Rng;
     use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
     use crate::utils::{
-        extract_hash160_from_base58_address, hash160, normalize_number_to_bit_length,
-        number_to_private_key, private_to_compressed_pubkey, save_private_key_to_file,
+        extract_hash160_from_base58_address, hash160, number_to_private_key,
+        private_to_compressed_pubkey, random_batch_base_with_bit_length, save_private_key_to_file,
     };
 
-    const FUNC_NAME: &str = "fill_randoms";
-    const SEED_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
+    const FUNC_NAME: &str = "fill_candidates";
 
     const KERNEL_SRC: &str = r#"
-extern "C" __device__ __forceinline__ unsigned long long xorshift64(unsigned long long *state) {
-    unsigned long long x = *state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    return x * 2685821657736338717ull;
-}
-
-extern "C" __global__ void fill_randoms(
-    unsigned long long seed,
-    unsigned int bits,
+extern "C" __global__ void fill_candidates(
+    unsigned long long base_hi,
+    unsigned long long base_lo,
     unsigned long long *out_hi,
     unsigned long long *out_lo,
     unsigned long long count
@@ -49,33 +38,8 @@ extern "C" __global__ void fill_randoms(
         return;
     }
 
-    unsigned int lo_bits = bits >= 64u ? 64u : bits;
-    unsigned int hi_bits = bits > 64u ? bits - 64u : 0u;
-
-    unsigned long long state = seed ^ ((idx + 1ull) * 0x9E3779B97F4A7C15ull);
-
-    unsigned long long lo = xorshift64(&state);
-    unsigned long long hi = xorshift64(&state);
-
-    if (lo_bits < 64u) {
-        unsigned long long mask = (1ull << lo_bits) - 1ull;
-        lo &= mask;
-    }
-
-    if (hi_bits == 0u) {
-        hi = 0ull;
-    } else if (hi_bits < 64u) {
-        unsigned long long mask = (1ull << hi_bits) - 1ull;
-        hi &= mask;
-    }
-
-    if (bits <= 64u) {
-        unsigned int shift = bits - 1u;
-        lo |= (1ull << shift);
-    } else {
-        unsigned int shift = hi_bits - 1u;
-        hi |= (1ull << shift);
-    }
+    unsigned long long lo = base_lo + idx;
+    unsigned long long hi = base_hi + (lo < base_lo ? 1ull : 0ull);
 
     out_hi[idx] = hi;
     out_lo[idx] = lo;
@@ -127,8 +91,8 @@ extern "C" __global__ void fill_randoms(
         let mut host_lo = vec![0u64; launch_shape.candidate_count];
 
         let mut rng = rand::thread_rng();
-        let mut seed = rng.r#gen::<u64>() | 1;
         let cfg = launch_shape.launch_config();
+        let count = launch_shape.candidate_count as u64;
 
         if stats {
             let device_name = ctx
@@ -148,14 +112,15 @@ extern "C" __global__ void fill_randoms(
         let mut last_report = Instant::now();
 
         loop {
-            seed = seed.wrapping_add(SEED_INCREMENT);
+            let base =
+                random_batch_base_with_bit_length(&mut rng, bits, launch_shape.candidate_count);
+            let (base_hi, base_lo) = u128_to_u64_halves(base);
 
             {
-                let count = launch_shape.candidate_count as u64;
                 let mut builder = stream.launch_builder(&func);
                 builder
-                    .arg(&seed)
-                    .arg(&bits)
+                    .arg(&base_hi)
+                    .arg(&base_lo)
                     .arg(&mut d_hi)
                     .arg(&mut d_lo)
                     .arg(&count);
@@ -193,10 +158,7 @@ extern "C" __global__ void fill_randoms(
                     .par_iter()
                     .zip(host_lo.par_iter())
                     .find_map_any(|(&hi, &lo)| {
-                        let num = normalize_number_to_bit_length(
-                            ((hi as u128) << 64) | (lo as u128),
-                            bits,
-                        );
+                        let num = ((hi as u128) << 64) | (lo as u128);
                         let private_key = number_to_private_key(num);
                         let public_key = private_to_compressed_pubkey(&private_key);
                         let derived_pubkey = hash160(&public_key);
@@ -234,6 +196,10 @@ extern "C" __global__ void fill_randoms(
             .num_threads(verify_threads)
             .thread_name(|idx| format!("scan-v3-verify-{idx}"))
             .build()
+    }
+
+    fn u128_to_u64_halves(value: u128) -> (u64, u64) {
+        ((value >> 64) as u64, value as u64)
     }
 
     impl CudaLaunchShape {
@@ -432,7 +398,81 @@ extern "C" __global__ void fill_randoms(
 
     #[cfg(test)]
     mod tests {
-        use super::{CudaLaunchShape, positive_cuda_attribute};
+        use super::{
+            CudaLaunchShape, FUNC_NAME, KERNEL_SRC, positive_cuda_attribute, preload_cuda_runtime,
+            select_cuda_context, u128_to_u64_halves,
+        };
+        use cudarc::{
+            driver::{LaunchConfig, PushKernelArg},
+            nvrtc::compile_ptx,
+        };
+
+        #[test]
+        fn cuda_kernel_uses_one_full_width_base_for_a_contiguous_batch() {
+            assert!(KERNEL_SRC.contains("base_hi"));
+            assert!(KERNEL_SRC.contains("base_lo"));
+            assert!(KERNEL_SRC.contains("lo < base_lo"));
+            assert!(!KERNEL_SRC.contains("xorshift64"));
+        }
+
+        #[test]
+        fn cuda_batch_base_preserves_both_u128_halves() {
+            let base = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdefu128;
+
+            assert_eq!(
+                u128_to_u64_halves(base),
+                (0xfedc_ba98_7654_3210, 0x0123_4567_89ab_cdef)
+            );
+        }
+
+        #[test]
+        #[ignore = "requires an NVIDIA GPU and CUDA runtime"]
+        fn cuda_kernel_materializes_a_contiguous_batch_across_u64_carry() {
+            preload_cuda_runtime().unwrap();
+            let ctx = select_cuda_context().unwrap();
+            let stream = ctx.default_stream();
+            let ptx = compile_ptx(KERNEL_SRC).unwrap();
+            let module = ctx.load_module(ptx).unwrap();
+            let func = module.load_function(FUNC_NAME).unwrap();
+
+            let base = 0x8123_4567_89ab_cdef_ffff_ffff_ffff_fffeu128;
+            let (base_hi, base_lo) = u128_to_u64_halves(base);
+            let count = 4u64;
+            let mut device_hi = stream.alloc_zeros::<u64>(count as usize).unwrap();
+            let mut device_lo = stream.alloc_zeros::<u64>(count as usize).unwrap();
+            let mut host_hi = vec![0u64; count as usize];
+            let mut host_lo = vec![0u64; count as usize];
+
+            let mut builder = stream.launch_builder(&func);
+            builder
+                .arg(&base_hi)
+                .arg(&base_lo)
+                .arg(&mut device_hi)
+                .arg(&mut device_lo)
+                .arg(&count);
+            unsafe {
+                builder
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .unwrap();
+            }
+
+            stream.memcpy_dtoh(&device_hi, &mut host_hi).unwrap();
+            stream.memcpy_dtoh(&device_lo, &mut host_lo).unwrap();
+            stream.synchronize().unwrap();
+
+            let candidates: Vec<u128> = host_hi
+                .into_iter()
+                .zip(host_lo)
+                .map(|(hi, lo)| ((hi as u128) << 64) | lo as u128)
+                .collect();
+            let expected: Vec<u128> = (0..count).map(|idx| base + idx as u128).collect();
+
+            assert_eq!(candidates, expected);
+        }
 
         #[test]
         fn cuda_launch_shape_uses_occupancy_dimensions() {

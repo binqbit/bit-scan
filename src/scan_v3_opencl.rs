@@ -17,9 +17,11 @@ use opencl3::{
     program::Program,
     types::{CL_BLOCKING, cl_uint},
 };
-use rand::Rng;
 
-use crate::utils::{extract_hash160_from_base58_address, save_private_key_to_file};
+use crate::utils::{
+    extract_hash160_from_base58_address, random_batch_base_with_bit_length,
+    save_private_key_to_file,
+};
 
 const MAX_KERNEL_SPAN: usize = u32::MAX as usize;
 const TARGET_KERNEL_TIME_NS: u64 = 250_000_000;
@@ -105,7 +107,7 @@ pub fn scan(pubkey: &str, bits: u32, stats: bool) -> Result<(), Box<dyn Error>> 
 
     loop {
         let launch_shape = config.launch_shape(bits, controller.loop_count);
-        let base = sample_batch_base(bits, launch_shape.candidate_count, &mut rng);
+        let base = random_batch_base_with_bit_length(&mut rng, bits, launch_shape.candidate_count);
         let base_words = u128_to_le_words(base);
 
         unsafe {
@@ -400,19 +402,6 @@ fn ensure_opencl_runtime_path() {
     }
 }
 
-fn sample_batch_base(bits: u32, candidate_count: usize, rng: &mut impl Rng) -> u128 {
-    debug_assert!(candidate_count > 0);
-    let span = candidate_count.saturating_sub(1) as u128;
-    let min = 1u128 << (bits - 1);
-    let max = if bits == 128 {
-        u128::MAX
-    } else {
-        (1u128 << bits) - 1
-    };
-    let max_base = max - span;
-    rng.gen_range(min..=max_base)
-}
-
 fn u128_to_le_words(value: u128) -> [u32; 8] {
     let mut words = [0u32; 8];
     words[0] = value as u32;
@@ -526,8 +515,9 @@ fn find_opencl_loader_in_nix_store() -> Option<PathBuf> {
 mod tests {
     use super::{
         KernelTimeController, OpenClHardwareLimits, OpenClScanConfig, TARGET_KERNEL_TIME_NS,
-        round_up_to_multiple, sample_batch_base,
+        round_up_to_multiple,
     };
+    use crate::utils::random_batch_base_with_bit_length;
     use rand::{SeedableRng, rngs::StdRng};
 
     const WIDTHS: [u32; 14] = [1, 7, 8, 9, 31, 32, 63, 64, 65, 70, 71, 72, 127, 128];
@@ -643,7 +633,7 @@ mod tests {
             };
 
             for _ in 0..64 {
-                let base = sample_batch_base(bits, shape.candidate_count, &mut rng);
+                let base = random_batch_base_with_bit_length(&mut rng, bits, shape.candidate_count);
                 let last = base + shape.candidate_count as u128 - 1;
                 assert!(base >= min);
                 assert!(last <= max);
