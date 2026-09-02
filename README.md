@@ -56,11 +56,20 @@ Validate a private key against the same wallet (supports optional `0x` prefix):
 bit-scan check 1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe 000000000000000202
 ```
 
+### Candidate generation
+
+- `v1` samples each candidate uniformly from the exact bit interval with an OS-seeded cryptographic RNG.
+- `v2` uses the same cryptographic RNG as an input to its intentionally non-uniform, analytics-guided bit-pattern generator.
+- `v3` draws one bounded OS-seeded random base per GPU batch and derives candidates as `base + candidate offset` without leaving the exact bit interval.
+- `v4` draws its base uniformly across the complete exact-bit interval and assigns circular `base + candidate offset` values across its CPU batch. This keeps every offset uniformly distributed and all candidates unique inside the batch.
+- Independently selected `v3` or `v4` batches can overlap.
+- `v5` and `v6` use deterministic Pollard kangaroo walks instead of independently randomized candidates.
+
 ### GPU engine (v3)
 
 The `v3` engine now prioritizes a full-GPU path: `private key -> secp256k1 public key -> hash160 -> compare` runs on the GPU through OpenCL, with the older CUDA batch generator kept only as a fallback.
 
-Both GPU paths draw one OS-seeded random base per batch on the host and derive candidates as `base + candidate offset`. The base spans the requested width (with the required top bit fixed), and is bounded so the complete batch remains inside the exact bit interval. Random generation is not performed separately for every GPU candidate. Batch bases are independent, so different batches can overlap.
+Both GPU paths use the batch scheme described above. The base spans the requested width (with the required top bit fixed) and is bounded so the complete batch remains inside the exact bit interval. Random generation is not performed separately for every GPU candidate.
 
 Build the project with:
 
